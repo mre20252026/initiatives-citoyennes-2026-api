@@ -1,4 +1,4 @@
-const path = require("path");
+// server.js (Render-safe: env vars + Postgres + CORS + stable endpoints)
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -6,89 +6,118 @@ const { Pool } = require("pg");
 const app = express();
 app.use(express.json());
 
-// CORS (à restreindre ensuite à ton GitHub Pages)
-const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-app.use(cors({ origin: allowedOrigin }));
+// ----- CORS -----
+const allowed = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// DB (Render fournira DATABASE_URL)
+app.use(cors({
+  origin: function (origin, cb) {
+    // allow server-to-server / curl without origin
+    if (!origin) return cb(null, true);
+    if (allowed.length === 0) return cb(null, true); // permissif si non configuré
+    return allowed.includes(origin) ? cb(null, true) : cb(new Error("CORS blocked"), false);
+  }
+}));
+
+// ----- DB -----
+if (!process.env.DATABASE_URL) {
+  console.error("Missing DATABASE_URL env var (Render Postgres).");
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
 });
 
-async function initDb() {
+// ----- DB init -----
+async function ensureSchema() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS registrations (
-      id SERIAL PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
+    CREATE TABLE IF NOT EXISTS preinscriptions (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
       country TEXT,
       interest TEXT,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      lang TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `);
-
-  await pool.query(`
-    INSERT INTO meta(key, value) VALUES ('base_count', '17')
-    ON CONFLICT (key) DO NOTHING;
+    CREATE UNIQUE INDEX IF NOT EXISTS preinscriptions_email_unique
+    ON preinscriptions (lower(email));
   `);
 }
 
+// ----- Health -----
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ----- Count (stable) -----
 async function getCount() {
-  const baseRes = await pool.query(`SELECT value FROM meta WHERE key='base_count'`);
-  const base = baseRes.rows[0] ? parseInt(baseRes.rows[0].value, 10) : 0;
-
-  const cRes = await pool.query(`SELECT COUNT(*)::int AS c FROM registrations`);
-  return base + (cRes.rows[0]?.c || 0);
+  const r = await pool.query(`SELECT COUNT(*)::int AS count FROM preinscriptions;`);
+  return r.rows[0].count;
 }
 
+app.get("/count", async (req, res) => {
+  try {
+    const count = await getCount();
+    res.json({ count });
+  } catch (e) {
+    console.error("GET /count error:", e);
+    res.status(500).json({ error: "count_failed" });
+  }
+});
+
+// Optional alias if your front ever calls /api/count
 app.get("/api/count", async (req, res) => {
   try {
-    res.json({ count: await getCount() });
+    const count = await getCount();
+    res.json({ count });
   } catch (e) {
-    res.status(500).json({ error: "server_error" });
+    console.error("GET /api/count error:", e);
+    res.status(500).json({ error: "count_failed" });
   }
 });
 
-app.post("/api/register", async (req, res) => {
+// ----- Create pre-inscription -----
+app.post("/signup", async (req, res) => {
   try {
-    const { email, country, interest } = req.body || {};
-    const cleanEmail = String(email || "").trim().toLowerCase();
-
-    const ok = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail);
-    if (!ok) return res.status(400).json({ error: "invalid_email" });
-
-    try {
-      await pool.query(
-        `INSERT INTO registrations(email, country, interest) VALUES ($1, $2, $3)`,
-        [cleanEmail, country || null, interest || null]
-      );
-      return res.json({ status: "created", count: await getCount() });
-    } catch (e) {
-      // email déjà existant
-      if (String(e.message || "").toLowerCase().includes("duplicate")) {
-        return res.json({ status: "exists", count: await getCount() });
-      }
-      throw e;
+    const { email, country, interest, lang } = req.body || {};
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "email_required" });
     }
+
+    const cleanEmail = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+      return res.status(400).json({ error: "email_invalid" });
+    }
+
+    await pool.query(
+      `INSERT INTO preinscriptions (email, country, interest, lang)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (lower(email)) DO NOTHING;`,
+      [cleanEmail, country || null, interest || null, lang || null]
+    );
+
+    const count = await getCount();
+    res.json({ ok: true, count });
   } catch (e) {
-    res.status(500).json({ error: "server_error" });
+    console.error("POST /signup error:", e);
+    res.status(500).json({ error: "signup_failed" });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// ----- Start -----
+const PORT = process.env.PORT || 10000;
 
-initDb()
-  .then(() => {
-    app.listen(PORT, () => console.log(`OK: listening on ${PORT}`));
-  })
-  .catch((e) => {
-    console.error("DB init failed", e);
+(async () => {
+  try {
+    await ensureSchema();
+    app.listen(PORT, () => console.log("API listening on", PORT));
+  } catch (e) {
+    console.error("Fatal init error:", e);
     process.exit(1);
-  });
+  }
+})();

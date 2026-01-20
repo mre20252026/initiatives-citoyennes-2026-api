@@ -42,6 +42,7 @@ async function ensureSchema() {
       lang TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+ 
   `);
 
   await pool.query(`
